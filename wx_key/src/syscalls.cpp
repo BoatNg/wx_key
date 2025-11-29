@@ -2,6 +2,8 @@
 #include "../include/string_obfuscator.h"
 #include <string>
 #include <cstdint>
+#include <array>
+#include <strsafe.h>
 
 // 静态成员初始化
 bool IndirectSyscalls::initialized = false;
@@ -33,6 +35,60 @@ bool IndirectSyscalls::ResolveFunction(const char* functionName, T& functionPoin
     return (functionPointer != nullptr);
 }
 
+namespace {
+    // 标准 stub 前缀：mov r10, rcx; mov eax, imm32; syscall; ret
+    bool LooksLikePatchedStub(void* fn) {
+        if (!fn) return true;
+        const uint8_t* code = reinterpret_cast<const uint8_t*>(fn);
+        // 4C 8B D1 B8 xx xx xx xx 0F 05 C3
+        constexpr std::array<uint8_t, 3> kPrefix = {0x4C, 0x8B, 0xD1};
+        for (size_t i = 0; i < kPrefix.size(); ++i) {
+            if (code[i] != kPrefix[i]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    FARPROC LoadCleanNtdllFunction(const char* functionName) {
+        wchar_t sysDir[MAX_PATH]{};
+        if (GetSystemDirectoryW(sysDir, MAX_PATH) == 0) {
+            return nullptr;
+        }
+
+        wchar_t ntdllPath[MAX_PATH]{};
+        if (FAILED(StringCchPrintfW(ntdllPath, MAX_PATH, L"%s\\ntdll.dll", sysDir))) {
+            return nullptr;
+        }
+
+        HMODULE hNtdll = LoadLibraryExW(
+            ntdllPath,
+            nullptr,
+            LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE | LOAD_LIBRARY_AS_IMAGE_RESOURCE | LOAD_LIBRARY_SEARCH_SYSTEM32
+        );
+        if (!hNtdll) {
+            return nullptr;
+        }
+
+        FARPROC fn = GetProcAddress(hNtdll, functionName);
+        FreeLibrary(hNtdll);
+        return fn;
+    }
+
+    void* ChooseSyscallSource(const char* functionName) {
+        void* fn = reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA(ObfuscatedStrings::GetNtdllName().c_str()), functionName));
+        if (fn && !LooksLikePatchedStub(fn)) {
+            return fn;
+        }
+
+        FARPROC clean = LoadCleanNtdllFunction(functionName);
+        if (clean) {
+            return reinterpret_cast<void*>(clean);
+        }
+        return fn;
+    }
+} // namespace
+
 bool IndirectSyscalls::Initialize() {
     if (initialized) {
         return true;
@@ -47,15 +103,15 @@ bool IndirectSyscalls::Initialize() {
     success &= ResolveFunction("NtProtectVirtualMemory", fnNtProtectVirtualMemory);
     success &= ResolveFunction("NtQueryInformationProcess", fnNtQueryInformationProcess);
 
-    // 构建直调 stub
-    scNtOpenProcess = reinterpret_cast<pNtOpenProcess>(CreateSyscallStub(ExtractSyscallNumber(fnNtOpenProcess)));
-    scNtReadVirtualMemory = reinterpret_cast<pNtReadVirtualMemory>(CreateSyscallStub(ExtractSyscallNumber(fnNtReadVirtualMemory)));
-    scNtWriteVirtualMemory = reinterpret_cast<pNtWriteVirtualMemory>(CreateSyscallStub(ExtractSyscallNumber(fnNtWriteVirtualMemory)));
-    scNtAllocateVirtualMemory = reinterpret_cast<pNtAllocateVirtualMemory>(CreateSyscallStub(ExtractSyscallNumber(fnNtAllocateVirtualMemory)));
-    scNtFreeVirtualMemory = reinterpret_cast<pNtFreeVirtualMemory>(CreateSyscallStub(ExtractSyscallNumber(fnNtFreeVirtualMemory)));
-    scNtProtectVirtualMemory = reinterpret_cast<pNtProtectVirtualMemory>(CreateSyscallStub(ExtractSyscallNumber(fnNtProtectVirtualMemory)));
-    scNtQueryInformationProcess = reinterpret_cast<pNtQueryInformationProcess>(CreateSyscallStub(ExtractSyscallNumber(fnNtQueryInformationProcess)));
-    
+    // 构建直调 stub，必要时使用干净的 ntdll 提取 SSN
+    scNtOpenProcess = reinterpret_cast<pNtOpenProcess>(CreateSyscallStub(ExtractSyscallNumber(ChooseSyscallSource("NtOpenProcess"))));
+    scNtReadVirtualMemory = reinterpret_cast<pNtReadVirtualMemory>(CreateSyscallStub(ExtractSyscallNumber(ChooseSyscallSource("NtReadVirtualMemory"))));
+    scNtWriteVirtualMemory = reinterpret_cast<pNtWriteVirtualMemory>(CreateSyscallStub(ExtractSyscallNumber(ChooseSyscallSource("NtWriteVirtualMemory"))));
+    scNtAllocateVirtualMemory = reinterpret_cast<pNtAllocateVirtualMemory>(CreateSyscallStub(ExtractSyscallNumber(ChooseSyscallSource("NtAllocateVirtualMemory"))));
+    scNtFreeVirtualMemory = reinterpret_cast<pNtFreeVirtualMemory>(CreateSyscallStub(ExtractSyscallNumber(ChooseSyscallSource("NtFreeVirtualMemory"))));
+    scNtProtectVirtualMemory = reinterpret_cast<pNtProtectVirtualMemory>(CreateSyscallStub(ExtractSyscallNumber(ChooseSyscallSource("NtProtectVirtualMemory"))));
+    scNtQueryInformationProcess = reinterpret_cast<pNtQueryInformationProcess>(CreateSyscallStub(ExtractSyscallNumber(ChooseSyscallSource("NtQueryInformationProcess"))));
+
     initialized = success;
     return success;
 }

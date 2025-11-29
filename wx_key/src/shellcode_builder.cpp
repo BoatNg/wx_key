@@ -33,28 +33,80 @@ std::vector<BYTE> ShellcodeBuilder::BuildHookShellcode(const ShellcodeConfig& co
         return shellcode;
     }
 
+    const bool enableStackSpoofing = config.enableStackSpoofing && config.spoofStackPointer != 0;
+    uint64_t spoofStackAligned = 0;
+    if (enableStackSpoofing) {
+        spoofStackAligned = static_cast<uint64_t>(config.spoofStackPointer) & ~static_cast<uint64_t>(0xF);
+    }
+
     // 生成机器码
     Xbyak::CodeGenerator code(1024, Xbyak::AutoGrow);
 
     Xbyak::Label skipCopy;
 
+    auto emitSaveRegs = [&]() {
+        code.pushfq();
+        code.push(code.rax);
+        code.push(code.rcx);
+        code.push(code.rdx);
+        code.push(code.rbx);
+        code.push(code.rbp);
+        code.push(code.rsi);
+        code.push(code.rdi);
+        code.push(code.r8);
+        code.push(code.r9);
+        code.push(code.r10);
+        code.push(code.r11);
+        code.push(code.r12);
+        code.push(code.r13);
+        code.push(code.r14);
+        code.push(code.r15);
+    };
+
+    auto emitRestoreRegs = [&]() {
+        code.pop(code.r15);
+        code.pop(code.r14);
+        code.pop(code.r13);
+        code.pop(code.r12);
+        code.pop(code.r11);
+        code.pop(code.r10);
+        code.pop(code.r9);
+        code.pop(code.r8);
+        code.pop(code.rdi);
+        code.pop(code.rsi);
+        code.pop(code.rbp);
+        code.pop(code.rbx);
+        code.pop(code.rdx);
+        code.pop(code.rcx);
+        code.pop(code.rax);
+        code.popfq();
+    };
+
+    if (enableStackSpoofing) {
+        // 将关键寄存器暂存到真实栈，再切换到对齐后的伪栈
+        code.push(code.rax); // 保存原始 rax
+        code.push(code.r10); // 保存原始 r10
+        code.push(code.r11); // 保存原始 r11
+
+        // rsp + 24 对应切换前的真实栈指针
+        code.lea(code.rax, code.ptr[code.rsp + 24]); // rax = original rsp
+
+        // 切换到伪栈（对齐到16字节），预留一定空间
+        code.mov(code.rsp, spoofStackAligned);
+        code.sub(code.rsp, 0x20);
+
+        // 将真实 RSP 存到伪栈，并构造一个假的返回地址槽位
+        code.push(code.rax);                        // [rsp] = original rsp
+        code.push(0);                               // 伪造返回地址，不破坏通用寄存器
+
+        // 恢复 r11/r10/rax 的原始值，确保后续保存寄存器时是原值
+        code.mov(code.r11, code.qword[code.rax - 24]);
+        code.mov(code.r10, code.qword[code.rax - 16]);
+        code.mov(code.rax, code.qword[code.rax - 8]);
+    }
+
     // ===== 保存寄存器/标志位 =====
-    code.pushfq();
-    code.push(code.rax);
-    code.push(code.rcx);
-    code.push(code.rdx);
-    code.push(code.rbx);
-    code.push(code.rbp);
-    code.push(code.rsi);
-    code.push(code.rdi);
-    code.push(code.r8);
-    code.push(code.r9);
-    code.push(code.r10);
-    code.push(code.r11);
-    code.push(code.r12);
-    code.push(code.r13);
-    code.push(code.r14);
-    code.push(code.r15);
+    emitSaveRegs();
 
     // ===== keySize 检查 =====
     code.mov(code.rax, code.ptr[code.rdx + 0x10]); // rax = keySize
@@ -80,22 +132,13 @@ std::vector<BYTE> ShellcodeBuilder::BuildHookShellcode(const ShellcodeConfig& co
     code.L(skipCopy);
 
     // ===== 恢复寄存器/标志位 =====
-    code.pop(code.r15);
-    code.pop(code.r14);
-    code.pop(code.r13);
-    code.pop(code.r12);
-    code.pop(code.r11);
-    code.pop(code.r10);
-    code.pop(code.r9);
-    code.pop(code.r8);
-    code.pop(code.rdi);
-    code.pop(code.rsi);
-    code.pop(code.rbp);
-    code.pop(code.rbx);
-    code.pop(code.rdx);
-    code.pop(code.rcx);
-    code.pop(code.rax);
-    code.popfq();
+    emitRestoreRegs();
+
+    if (enableStackSpoofing) {
+        // 丢弃伪造返回地址并恢复真实 RSP，切回原始栈
+        code.add(code.rsp, 8); // skip fake return slot
+        code.pop(code.rsp);
+    }
 
     // ===== 跳回 Trampoline =====
     code.mov(code.rax, (uint64_t)config.trampolineAddress);

@@ -1874,15 +1874,6 @@ class _MyHomePageState extends State<MyHomePage>
       ),
       child: ElevatedButton(
         onPressed: isBusy ? null : _getImageKeys,
-        child: Text(
-          labelText,
-          style: const TextStyle(
-            fontSize: 14,
-            fontWeight: FontWeight.w500,
-            fontFamily: 'HarmonyOS_SansSC',
-            letterSpacing: 0.3,
-          ),
-        ),
         style: ElevatedButton.styleFrom(
           backgroundColor: Colors.blue.shade600,
           foregroundColor: Colors.white,
@@ -1892,6 +1883,15 @@ class _MyHomePageState extends State<MyHomePage>
           shadowColor: Colors.transparent,
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(14),
+          ),
+        ),
+        child: Text(
+          labelText,
+          style: const TextStyle(
+            fontSize: 14,
+            fontWeight: FontWeight.w500,
+            fontFamily: 'HarmonyOS_SansSC',
+            letterSpacing: 0.3,
           ),
         ),
       ),

@@ -122,7 +122,7 @@ class AppLogger {
     
     try {
       final logFile = File(logFilePath);
-      final content = _buffer.join('\n') + '\n';
+      final content = '${_buffer.join('\n')}\n';
       await logFile.writeAsString(content, mode: FileMode.append);
       _buffer.clear();
     } catch (e) {

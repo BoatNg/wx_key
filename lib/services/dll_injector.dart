@@ -197,7 +197,6 @@ class DllInjector {
 
       free(subKeyName);
       RegCloseKey(phkResult.value);
-    } catch (e) {
     } finally {
       free(phkResult);
     }
@@ -547,9 +546,7 @@ class DllInjector {
       }
 
       // 如果用户设置的目录无效，尝试从注册表获取路径
-      if (wechatPath == null) {
-        wechatPath = _getWeChatPathFromRegistry();
-      }
+      wechatPath ??= _getWeChatPathFromRegistry();
 
       // 如果注册表也没找到，尝试常见的默认路径
       if (wechatPath == null || !await File(wechatPath).exists()) {
@@ -655,7 +652,7 @@ class DllInjector {
       await Future.delayed(const Duration(milliseconds: 500));
     }
 
-    AppLogger.warning('等待微信界面组件超时(已等待${maxWaitSeconds}秒)，但窗口可能已就绪');
+    AppLogger.warning('等待微信界面组件超时(已等待$maxWaitSeconds秒)，但窗口可能已就绪');
     return true;
   }
 
@@ -664,7 +661,7 @@ class DllInjector {
     _topWindowHandlesCollector = handles;
     _topWindowTargetPid = targetPid;
     EnumWindows(
-      Pointer.fromFunction<EnumWindowsProc>(_enumWechatTopWindowProc, 0),
+      Pointer.fromFunction<WNDENUMPROC>(_enumWechatTopWindowProc, 0),
       0,
     );
     _topWindowHandlesCollector = null;
@@ -723,7 +720,7 @@ class DllInjector {
     _childWindowCollector = children;
     EnumChildWindows(
       parentHwnd,
-      Pointer.fromFunction<EnumWindowsProc>(_enumChildWindowProc, 0),
+      Pointer.fromFunction<WNDENUMPROC>(_enumChildWindowProc, 0),
       0,
     );
     _childWindowCollector = null;
@@ -838,7 +835,7 @@ class DllInjector {
 
 
   static int? findMainWeChatPid() {
-    final enumWindowsProc = Pointer.fromFunction<EnumWindowsProc>(_enumWindowsProc, 0);
+    final enumWindowsProc = Pointer.fromFunction<WNDENUMPROC>(_enumWindowsProc, 0);
     final pidsPtr = calloc<Pointer<Int32>>();
     pidsPtr.value = calloc<Int32>(100);
 
