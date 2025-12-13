@@ -329,62 +329,102 @@ class ImageKeyService {
 
       var scannedCount = 0;
       var skippedCount = 0;
-      
+      const chunkSize = 4 * 1024 * 1024; // 4MB
+      const overlap = 33; // 避免跨块遗漏
+
       for (var region in memoryRegions) {
         final baseAddress = region.$1;
         final regionSize = region.$2;
-        
+
         // 跳过太大的内存区域
         if (regionSize > 100 * 1024 * 1024) {
           skippedCount++;
+          AppLogger.warning(
+            '跳过过大内存区域: 0x${baseAddress.toRadixString(16)} size=$regionSize',
+          );
           continue;
         }
-        
+
         scannedCount++;
         if (scannedCount % 10 == 0) {
           onProgress?.call('正在扫描微信内存... ($scannedCount/$totalRegions)');
           await Future<void>.delayed(const Duration(milliseconds: 1));
         }
-        
-        final memory = _readProcessMemory(hProcess, baseAddress, regionSize);
-        if (memory == null) continue;
 
-        // 直接在原始字节中搜索32字节的小写字母数字序列
-        // 类似YARA规则: /[^a-z0-9][a-z0-9]{32}[^a-z0-9]/
-        for (var i = 0; i < memory.length - 34; i++) {
-          final byte = memory[i];
-          
-          // 检查前导字符（不是小写字母或数字）
-          if (_isAlphaNumLower(byte)) continue;
-          
-          // 检查接下来32个字节是否都是小写字母或数字
-          var isValid = true;
-          for (var j = 1; j <= 32; j++) {
-            if (i + j >= memory.length || !_isAlphaNumLower(memory[i + j])) {
-              isValid = false;
-              break;
-            }
-          }
-          
-          if (!isValid) continue;
-          
-          // 检查尾部字符（不是小写字母或数字）
-          if (i + 33 < memory.length && _isAlphaNumLower(memory[i + 33])) {
+        var offset = 0;
+        Uint8List? trailing;
+
+        while (offset < regionSize) {
+          final remaining = regionSize - offset;
+          final currentChunkSize = remaining > chunkSize ? chunkSize : remaining;
+          final chunk = _readProcessMemory(
+            hProcess,
+            baseAddress + offset,
+            currentChunkSize,
+          );
+
+          if (chunk == null || chunk.isEmpty) {
+            AppLogger.warning(
+              '跳过无法读取的内存块: base=0x${(baseAddress + offset).toRadixString(16)} size=$currentChunkSize',
+            );
+            offset += currentChunkSize;
+            trailing = null;
             continue;
           }
-          
-          try {
-            final keyBytes = memory.sublist(i + 1, i + 33);
+
+          // 与上一块尾部拼接，避免跨块遗漏
+          Uint8List dataToScan;
+          if (trailing != null && trailing.isNotEmpty) {
+            dataToScan = Uint8List(trailing.length + chunk.length);
+            dataToScan.setAll(0, trailing);
+            dataToScan.setAll(trailing.length, chunk);
+          } else {
+            dataToScan = chunk;
+          }
+
+          // 直接在原始字节中搜索32字节的小写字母数字序列
+          // 类似YARA规则: /[^a-z0-9][a-z0-9]{32}[^a-z0-9]/
+          for (var i = 0; i < dataToScan.length - 34; i++) {
+            final byte = dataToScan[i];
             
-            if (_verifyKey(ciphertext, keyBytes)) {
-              AppLogger.success('在第 $scannedCount 个区域找到AES密钥');
-              onProgress?.call('已找到AES密钥，正在校验...');
-              CloseHandle(hProcess);
-              return String.fromCharCodes(keyBytes);
+            // 检查前导字符（不是小写字母或数字）
+            if (_isAlphaNumLower(byte)) continue;
+            
+            // 检查接下来32个字节是否都是小写字母或数字
+            var isValid = true;
+            for (var j = 1; j <= 32; j++) {
+              if (i + j >= dataToScan.length || !_isAlphaNumLower(dataToScan[i + j])) {
+                isValid = false;
+                break;
+              }
             }
-          } catch (e) {
-            continue;
+            
+            if (!isValid) continue;
+            
+            // 检查尾部字符（不是小写字母或数字）
+            if (i + 33 < dataToScan.length && _isAlphaNumLower(dataToScan[i + 33])) {
+              continue;
+            }
+            
+            try {
+              final keyBytes = dataToScan.sublist(i + 1, i + 33);
+              
+              if (_verifyKey(ciphertext, keyBytes)) {
+                AppLogger.success('在第 $scannedCount 个区域找到AES密钥');
+                onProgress?.call('已找到AES密钥，正在校验...');
+                CloseHandle(hProcess);
+                return String.fromCharCodes(keyBytes);
+              }
+            } catch (e) {
+              AppLogger.warning('校验密钥时出现异常: $e');
+              continue;
+            }
           }
+
+          // 保存末尾，覆盖跨块
+          final start = dataToScan.length - overlap;
+          trailing = dataToScan.sublist(start < 0 ? 0 : start);
+          offset += currentChunkSize;
         }
       }
 
@@ -432,7 +472,9 @@ class ImageKeyService {
         }
 
         // 只收集已提交的私有内存
-        if (mbi.ref.State == MEM_COMMIT && mbi.ref.Type == MEM_PRIVATE) {
+        if (mbi.ref.State == MEM_COMMIT &&
+            mbi.ref.Type == MEM_PRIVATE &&
+            _isReadableProtect(mbi.ref.Protect)) {
           regions.add((mbi.ref.BaseAddress, mbi.ref.RegionSize));
         }
 
@@ -452,30 +494,44 @@ class ImageKeyService {
     return regions;
   }
 
+  static bool _isReadableProtect(int protect) {
+    if (protect == PAGE_NOACCESS) {
+      return false;
+    }
+    if ((protect & PAGE_GUARD) != 0) {
+      return false;
+    }
+    return true;
+  }
+
   /// 读取进程内存
   static Uint8List? _readProcessMemory(int hProcess, int address, int size) {
-    final buffer = calloc<Uint8>(size);
-    final bytesRead = calloc<SIZE_T>();
-
     try {
-      final result = ReadProcessMemory(
-        hProcess,
-        Pointer.fromAddress(address),
-        buffer,
-        size,
-        bytesRead,
-      );
+      final buffer = calloc<Uint8>(size);
+      final bytesRead = calloc<SIZE_T>();
 
-      if (result == 0) {
-        return null;
+      try {
+        final result = ReadProcessMemory(
+          hProcess,
+          Pointer.fromAddress(address),
+          buffer,
+          size,
+          bytesRead,
+        );
+
+        final readCount = result != 0 ? bytesRead.value : 0;
+        if (result == 0 || readCount == 0) {
+          return null;
+        }
+
+        return Uint8List.fromList(buffer.asTypedList(readCount));
+      } finally {
+        free(buffer);
+        free(bytesRead);
       }
-
-      return Uint8List.fromList(buffer.asTypedList(size));
     } catch (e) {
+      AppLogger.error('读取进程内存失败: $e');
       return null;
-    } finally {
-      free(buffer);
-      free(bytesRead);
     }
   }
 
