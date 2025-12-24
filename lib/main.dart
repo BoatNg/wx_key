@@ -1229,9 +1229,11 @@ class _MyHomePageState extends State<MyHomePage>
       _addLogMessage('ERROR', '获取图片密钥时出错');
       await AppLogger.error('获取图片密钥时出错', e, stackTrace);
     } finally {
-      setState(() {
-        _isGettingImageKey = false;
-      });
+      if (mounted) {
+        setState(() {
+          _isGettingImageKey = false;
+        });
+      }
       _imageKeyProgressMessage = null;
     }
   }

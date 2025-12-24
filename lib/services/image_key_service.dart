@@ -315,7 +315,8 @@ class ImageKeyService {
     
     final hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     if (hProcess == 0) {
-      AppLogger.error('无法打开进程进行内存搜索');
+      final lastError = GetLastError();
+      AppLogger.error('无法打开进程进行内存搜索，错误码: $lastError');
       return null;
     }
 
@@ -330,7 +331,7 @@ class ImageKeyService {
       var scannedCount = 0;
       var skippedCount = 0;
       const chunkSize = 4 * 1024 * 1024; // 4MB
-      const overlap = 33; // 避免跨块遗漏
+      const overlap = 65; // 覆盖ASCII/UTF-16密钥跨块情况
 
       for (var region in memoryRegions) {
         final baseAddress = region.$1;
@@ -382,42 +383,69 @@ class ImageKeyService {
             dataToScan = chunk;
           }
 
-          // 直接在原始字节中搜索32字节的小写字母数字序列
-          // 类似YARA规则: /[^a-z0-9][a-z0-9]{32}[^a-z0-9]/
+          // 直接在原始字节中搜索32字节ASCII/UTF-16密钥
+          // 类似YARA规则: /[^a-zA-Z0-9][a-zA-Z0-9]{32}[^a-zA-Z0-9]/
           for (var i = 0; i < dataToScan.length - 34; i++) {
             final byte = dataToScan[i];
-            
-            // 检查前导字符（不是小写字母或数字）
-            if (_isAlphaNumLower(byte)) continue;
-            
-            // 检查接下来32个字节是否都是小写字母或数字
+
+            // ASCII 32字节密钥：检查前导字符（不是字母或数字）
+            if (_isAlphaNumAscii(byte)) {
+              continue;
+            }
+
             var isValid = true;
             for (var j = 1; j <= 32; j++) {
-              if (i + j >= dataToScan.length || !_isAlphaNumLower(dataToScan[i + j])) {
+              if (i + j >= dataToScan.length ||
+                  !_isAlphaNumAscii(dataToScan[i + j])) {
                 isValid = false;
                 break;
               }
             }
-            
-            if (!isValid) continue;
-            
-            // 检查尾部字符（不是小写字母或数字）
-            if (i + 33 < dataToScan.length && _isAlphaNumLower(dataToScan[i + 33])) {
+
+            if (isValid) {
+              // 检查尾部字符（不是字母或数字）
+              if (i + 33 < dataToScan.length &&
+                  _isAlphaNumAscii(dataToScan[i + 33])) {
+                isValid = false;
+              }
+            }
+
+            if (isValid) {
+              try {
+                final keyBytes = dataToScan.sublist(i + 1, i + 33);
+
+                if (_verifyKey(ciphertext, keyBytes)) {
+                  AppLogger.success('在第 $scannedCount 个区域找到AES密钥');
+                  onProgress?.call('已找到AES密钥，正在校验...');
+                  CloseHandle(hProcess);
+                  return String.fromCharCodes(keyBytes);
+                }
+              } catch (e) {
+                AppLogger.warning('校验密钥时出现异常: $e');
+              }
+            }
+          }
+
+          // 兼容UTF-16LE存储的32字节ASCII密钥
+          for (var i = 0; i < dataToScan.length - 65; i++) {
+            if (!_isUtf16AsciiKey(dataToScan, i)) {
               continue;
             }
-            
+
             try {
-              final keyBytes = dataToScan.sublist(i + 1, i + 33);
-              
+              final keyBytes = Uint8List(32);
+              for (var j = 0; j < 32; j++) {
+                keyBytes[j] = dataToScan[i + (j * 2)];
+              }
+
               if (_verifyKey(ciphertext, keyBytes)) {
-                AppLogger.success('在第 $scannedCount 个区域找到AES密钥');
+                AppLogger.success('在第 $scannedCount 个区域找到AES密钥(UTF-16)');
                 onProgress?.call('已找到AES密钥，正在校验...');
                 CloseHandle(hProcess);
                 return String.fromCharCodes(keyBytes);
               }
             } catch (e) {
-              AppLogger.warning('校验密钥时出现异常: $e');
-              continue;
+              AppLogger.warning('校验UTF-16密钥时出现异常: $e');
             }
           }
 
@@ -438,10 +466,27 @@ class ImageKeyService {
     }
   }
   
-  /// 检查字节是否是小写字母或数字
-  static bool _isAlphaNumLower(int byte) {
+  /// 检查字节是否是字母或数字(ASCII)
+  static bool _isAlphaNumAscii(int byte) {
     return (byte >= 0x61 && byte <= 0x7A) || // a-z
-           (byte >= 0x30 && byte <= 0x39);    // 0-9
+        (byte >= 0x41 && byte <= 0x5A) || // A-Z
+        (byte >= 0x30 && byte <= 0x39); // 0-9
+  }
+
+  static bool _isUtf16AsciiKey(Uint8List data, int start) {
+    if (start + 64 > data.length) {
+      return false;
+    }
+
+    for (var j = 0; j < 32; j++) {
+      final charByte = data[start + (j * 2)];
+      final nullByte = data[start + (j * 2) + 1];
+      if (nullByte != 0x00 || !_isAlphaNumAscii(charByte)) {
+        return false;
+      }
+    }
+
+    return true;
   }
 
   /// 获取进程的内存区域
@@ -473,8 +518,8 @@ class ImageKeyService {
 
         // 只收集已提交的私有内存
         if (mbi.ref.State == MEM_COMMIT &&
-            mbi.ref.Type == MEM_PRIVATE &&
-            _isReadableProtect(mbi.ref.Protect)) {
+            _isReadableProtect(mbi.ref.Protect) &&
+            _isCandidateRegionType(mbi.ref.Type)) {
           regions.add((mbi.ref.BaseAddress, mbi.ref.RegionSize));
         }
 
@@ -502,6 +547,10 @@ class ImageKeyService {
       return false;
     }
     return true;
+  }
+
+  static bool _isCandidateRegionType(int type) {
+    return type == MEM_PRIVATE || type == MEM_MAPPED || type == MEM_IMAGE;
   }
 
   /// 读取进程内存
@@ -618,7 +667,10 @@ class ImageKeyService {
         pids.first,
         ciphertext,
         onProgress,
-      );
+      ).timeout(const Duration(seconds: 45), onTimeout: () async {
+        await AppLogger.error('内存搜索超时，可能被系统权限或安全软件阻止');
+        return null;
+      });
       if (aesKey == null) {
         AppLogger.error('无法从内存中获取AES密钥');
         return ImageKeyResult.failure('无法从内存中获取AES密钥');
@@ -628,8 +680,8 @@ class ImageKeyService {
 
       AppLogger.success('图片密钥获取完成');
       return ImageKeyResult.success(xorKey, aesKey.substring(0, 16));
-    } catch (e) {
-      AppLogger.error('获取密钥失败: $e');
+    } catch (e, stackTrace) {
+      AppLogger.error('获取密钥失败', e, stackTrace);
       return ImageKeyResult.failure('获取密钥失败: $e');
     }
   } 
